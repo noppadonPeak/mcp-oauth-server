@@ -14,17 +14,38 @@ const REDIRECT_URI = `${DOMAIN}/callback`;
 let accessToken = null;
 
 const app = express();
-let transport = null;
+app.use(express.json());
+
+const transports = new Map();
+
+app.get("/", (req, res) => {
+  res.send("MCP Server is running! Use /sse for MCP connection.");
+});
 
 app.get("/sse", async (req, res) => {
-  transport = new SSEServerTransport("/messages", res);
+  console.log("New SSE connection attempt");
+  const transport = new SSEServerTransport("/messages", res);
   await server.connect(transport);
+
+  const sessionId = transport.sessionId;
+  transports.set(sessionId, transport);
+  console.log(`Connected session: ${sessionId}`);
+
+  res.on("close", () => {
+    transports.delete(sessionId);
+    server.closeTransport(transport);
+    console.log(`Disconnected session: ${sessionId}`);
+  });
 });
 
 app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports.get(sessionId);
+
   if (transport) {
     await transport.handlePostMessage(req, res);
   } else {
+    console.error(`Received message for unknown session: ${sessionId}`);
     res.status(400).send("No active transport");
   }
 });
