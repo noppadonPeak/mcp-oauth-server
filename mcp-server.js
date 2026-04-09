@@ -92,6 +92,10 @@ app.get("/callback", (req, res) => {
   const code = req.query.code;
   const sessionId = req.query.session_id; // รับ sessionId คืนมาจาก state
 
+  console.log("callback", code, sessionId);
+  let keys = sessions.keys();
+  console.log("session keys", keys);
+
   if (code && sessionId && sessions.has(sessionId)) {
     const session = sessions.get(sessionId);
     session.accessToken = `mock-token-${code}`;
