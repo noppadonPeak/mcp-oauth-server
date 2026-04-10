@@ -1,114 +1,154 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
+import cors from "cors";
+import crypto from "node:crypto";
+import jwt from "jsonwebtoken";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
-const PORT = process.env.PORT || 3000;
-const DOMAIN = process.env.DOMAIN || "http://localhost:3000"; // URL ของ Server ที่ได้จาก Render
-const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || "http://localhost:5500/"; // URL จาก GitHub Pages
-const REDIRECT_URI = `${DOMAIN}/callback`;
+const SECRET_KEY = "your-very-secure-secret";
+const LOGIN_PAGE_URL = "https://noppadonpeak.github.io/mcp-auth-web";
+const MCP_SERVER_URL = "https://mcp-oauth-server-bxh3.onrender.com";
 
 const app = express();
-// ลบ express.json() ออกเพื่อให้ MCP SDK จัดการ Stream เองได้
+app.use(express.json());
 
-// เก็บข้อมูลแต่ละ Session: { transport, server, accessToken }
-const sessions = new Map();
+// --- [SETTING] CORS ---
+// อนุญาตให้ Web Login เข้าถึง API ได้ (ปรับเปลี่ยน URL ตามจริง)
+app.use(
+  cors({
+    origin: [LOGIN_PAGE_URL, `[${LOGIN_PAGE_URL}](${LOGIN_PAGE_URL})`],
+    credentials: true,
+  }),
+);
 
-app.get("/", (req, res) => {
-  res.send("MCP Server is running! Use /sse for MCP connection.");
+// --- [DB] PERSISTENCE (In-Memory) ---
+const authSessions = new Map(); // เก็บ { state: { codeChallenge, clientId, redirectUri } }
+const validTokens = new Map(); // เก็บ { accessToken: { user, expiresAt } }
+
+// ฟังก์ชันช่วยตรวจสอบ PKCE S256
+function verifyPKCE(verifier, challenge) {
+  console.log("verifyPKCE");
+  const hash = crypto.createHash("sha256").update(verifier).digest("base64url");
+  console.log(verifier, challenge, hash);
+  return hash === challenge;
+}
+
+// --- [PART 1] DISCOVERY ---
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.json({
+    resource: MCP_SERVER_URL,
+    authorization_servers: [MCP_SERVER_URL],
+    scopes_supported: ["mcp:tools"],
+  });
 });
 
-app.get("/sse", async (req, res) => {
-  console.log("New SSE connection attempt");
-  const transport = new SSEServerTransport("/messages", res);
-  const sessionId = transport.sessionId;
+// --- [PART 2] OAUTH ENDPOINTS ---
+app.get("/oauth/authorize", (req, res) => {
+  const {
+    client_id,
+    redirect_uri,
+    state,
+    code_challenge,
+    code_challenge_method,
+  } = req.query;
 
-  // สร้าง Server สำหรับแต่ละ Session เพื่อเลี่ยง Error "Already connected"
-  const server = new Server(
-    { name: "hosted-mcp", version: "1.0.0" },
-    { capabilities: { tools: {} } },
+  // เก็บข้อมูลลง Session DB ชั่วคราว
+  authSessions.set(state, {
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge,
+    method: code_challenge_method || "S256",
+  });
+
+  // ส่งไปหน้า Login พร้อมส่ง state ไปด้วย
+  res.redirect(
+    `${LOGIN_PAGE_URL}?state=${state}&client_id=${client_id}&redirect=${encodeURIComponent(redirect_uri)}`,
   );
-
-  // ตั้งค่า Handlers สำหรับ Server นี้
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: "hello_cloud",
-        description: "Say hello from a hosted server",
-        inputSchema: { type: "object", properties: {} },
-      },
-    ],
-  }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name === "hello_cloud") {
-      const session = sessions.get(sessionId);
-      if (!session || !session.accessToken) {
-        // ส่ง sessionId ไปใน state เพื่อให้รู้ว่าใครกำลังล็อกอิน
-        const loginUrl = `${AUTH_SERVER_URL}?client_id=mcp&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&session_id=${sessionId}`;
-        return {
-          content: [{ type: "text", text: `🔑 กรุณาล็อกอินก่อน: ${loginUrl}` }],
-          isError: true,
-        };
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: "สวัสดี! นี่คือข้อความจาก MCP Server บน Cloud",
-          },
-        ],
-      };
-    }
-  });
-
-  await server.connect(transport);
-
-  sessions.set(sessionId, { transport, server, accessToken: null });
-  console.log(`Connected session: ${sessionId}`);
-
-  res.on("close", () => {
-    sessions.delete(sessionId);
-    console.log(`Disconnected session: ${sessionId}`);
-  });
-});
-
-app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const session = sessions.get(sessionId);
-
-  if (session && session.transport) {
-    await session.transport.handlePostMessage(req, res);
-  } else {
-    console.error(`Received message for unknown session: ${sessionId}`);
-    res.status(400).send("No active transport");
-  }
 });
 
 app.get("/callback", (req, res) => {
-  const code = req.query.code;
-  const sessionId = req.query.session_id; // รับ sessionId คืนมาจาก state
+  const { code, state, code_verifier, client_id } = req.query;
+  const session = authSessions.get(state);
 
-  console.log("callback", code, sessionId);
-  let keys = sessions.keys();
-  console.log("session keys", keys);
+  console.log("callback");
+  console.log("authSessions list", Array.from(authSessions.keys()));
+  console.log("session", session);
+  console.log("code_verifier", code_verifier);
 
-  if (code && sessionId && sessions.has(sessionId)) {
-    const session = sessions.get(sessionId);
-    session.accessToken = `mock-token-${code}`;
+  if (!session) {
+    return res.status(400).send(`
+      <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+        <h1 style="color: #ef4444;">❌ ไม่สำเร็จ</h1>
+        <p>Invalid state: เซสชันหมดอายุหรือข้อมูลไม่ถูกต้อง</p>
+      </body>
+    `);
+  }
 
-    res.send(`
+  // ตรวจสอบ PKCE
+  //if (!verifyPKCE(code_verifier, session.codeChallenge)) {
+  if (code_verifier !== session.codeChallenge) {
+    return res.status(400).send(`
+      <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+        <h1 style="color: #ef4444;">❌ ไม่สำเร็จ</h1>
+        <p>PKCE verification failed: ข้อมูลการยืนยันไม่ถูกต้อง</p>
+      </body>
+    `);
+  }
+
+  // สร้าง Access Token
+  const accessToken = jwt.sign({ user: "demo-user" }, SECRET_KEY);
+
+  // บันทึกลง Persistence DB
+  validTokens.set(accessToken, {
+    user: "demo-user",
+    clientId: client_id,
+  });
+
+  // ลบ session ที่ใช้แล้ว
+  authSessions.delete(state);
+
+  // res.json({
+  //   access_token: accessToken,
+  //   token_type: "Bearer",
+  //   expires_in: 3600,
+  // });
+
+  console.log("Done ✅");
+  console.log("authSessions", authSessions);
+  console.log("validTokens", validTokens);
+  res.send(`
       <body style="font-family: sans-serif; text-align: center; padding: 50px;">
         <h1 style="color: #10b981;">✅ สำเร็จ!</h1>
         <p>เชื่อมต่อเรียบร้อย กลับไปคุยกับ Claude ได้เลย</p>
       </body>
     `);
-  } else {
-    res.status(400).send("Invalid callback or session expired.");
-  }
 });
 
-app.listen(PORT, () => console.error(`Server running on port ${PORT}`));
+// --- [PART 3] MCP SERVER LOGIC ---
+const mcp = new McpServer({ name: "Secure Remote Server", version: "1.0.0" });
+
+mcp.tool("check_auth", {}, async () => ({
+  content: [{ type: "text", text: "คุณผ่านการตรวจสอบ PKCE และ Token สำเร็จ!" }],
+}));
+
+let transport;
+app.get("/mcp/sse", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+
+  // ตรวจสอบ Token จาก Persistence DB
+  if (!token || !validTokens.has(token)) {
+    return res.status(401).send("Unauthorized: Invalid or expired token");
+  }
+
+  transport = new SSEServerTransport("/mcp/messages", res);
+  await mcp.connect(transport);
+});
+
+app.post("/mcp/messages", async (req, res) => {
+  if (transport) await transport.handlePostMessage(req, res);
+});
+
+app.listen(3000, () =>
+  console.log("MCP Server running on http://localhost:3000"),
+);
